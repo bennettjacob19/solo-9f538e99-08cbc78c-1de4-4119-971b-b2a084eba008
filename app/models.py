@@ -22,6 +22,7 @@ class Model:
     weights: np.ndarray  # shape (n_classes, n_features)
     bias: np.ndarray  # shape (n_classes,)
     labels: List[str]  # length n_classes
+    normal_label: Optional[str] = None  # label that counts as "normal"; optional
 
     @property
     def n_classes(self) -> int:
@@ -68,11 +69,14 @@ def _as_vector(value: Any, name: str) -> np.ndarray:
     return arr
 
 
-def validate_artifact(payload: Any) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+def validate_artifact(
+    payload: Any,
+) -> Tuple[np.ndarray, np.ndarray, List[str], Optional[str]]:
     """Validate an uploaded artifact and return normalised arrays.
 
     Accepted shape for ``weights`` is ``(n_classes, n_features)``.  ``bias``
-    must have ``n_classes`` entries and ``labels`` must name every class.
+    must have ``n_classes`` entries, ``labels`` must name every class, and an
+    optional ``normal_label`` must be one of those labels.
     """
     if not isinstance(payload, dict):
         raise ModelValidationError("request body must be a JSON object")
@@ -103,17 +107,35 @@ def validate_artifact(payload: Any) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         raise ModelValidationError(
             f"labels has {len(labels)} entries but weights has {weights.shape[0]} classes"
         )
-    return weights, bias, labels
+    normal_label = _validate_normal_label(payload.get("normal_label"), labels)
+    return weights, bias, labels, normal_label
+
+
+def _validate_normal_label(
+    normal_label: Any, labels: List[str]
+) -> Optional[str]:
+    """Validate the optional ``normal_label`` against the version's label set."""
+    if normal_label is None:
+        return None
+    if not isinstance(normal_label, str) or not normal_label:
+        raise ModelValidationError("normal_label must be a non-empty string when provided")
+    if normal_label not in labels:
+        raise ModelValidationError(
+            f"normal_label {normal_label!r} must be one of this version's labels: {labels}"
+        )
+    return normal_label
 
 
 def save_artifact(path: str, version: str, payload: Dict[str, Any]) -> None:
-    weights, bias, labels = validate_artifact(payload)
+    weights, bias, labels, normal_label = validate_artifact(payload)
     doc = {
         "version": version,
         "weights": weights.tolist(),
         "bias": bias.tolist(),
         "labels": labels,
     }
+    if normal_label is not None:
+        doc["normal_label"] = normal_label
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
@@ -130,9 +152,15 @@ def load_model(path: str, version: Optional[str] = None) -> Model:
         raise ModelValidationError(f"model file not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise ModelValidationError(f"model file is not valid JSON: {exc}") from exc
-    weights, bias, labels = validate_artifact(doc)
+    weights, bias, labels, normal_label = validate_artifact(doc)
     resolved = version or doc.get("version") or "unknown"
-    model = Model(version=resolved, weights=weights, bias=bias, labels=labels)
+    model = Model(
+        version=resolved,
+        weights=weights,
+        bias=bias,
+        labels=labels,
+        normal_label=normal_label,
+    )
     if model.n_features == 0:  # pragma: no cover - guarded by validate
         raise ModelValidationError("weights must have at least one feature column")
     return model

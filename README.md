@@ -6,12 +6,14 @@ are replaced online — without dropping accepted inference and without ever
 running a third model process.
 
 ```
-POST /infer           classify a feature vector (with optional client timeout)
-POST /admin/models    upload weights/bias/labels and hot-swap the model in
-GET  /admin/versions  version registry
-GET  /admin/status    active version, in-flight counts, per-process state
-GET  /healthz         liveness
-GET  /docs            Swagger UI (interactive; shows every field)
+POST /infer                          classify a feature vector (optional device_id, client timeout)
+POST /admin/models                   upload weights/bias/labels (optional normal_label) and hot-swap
+GET  /admin/versions                 version registry
+GET  /admin/status                   active version, in-flight counts, per-process state
+GET  /admin/device-alarms            per-device alarm states (all devices)
+GET  /admin/device-alarms/{device_id} one device's version, streak, alarm, pending count
+GET  /healthz                        liveness
+GET  /docs                           Swagger UI (interactive; shows every field)
 ```
 
 ## Running it
@@ -57,10 +59,52 @@ weights @ features + bias`, and the highest-scoring label wins.
 entries, and `labels` must be `n_classes` unique non-empty strings. Anything
 else is rejected with 422 before a process is started.
 
+### `normal_label` (optional)
+
+An upload may set `normal_label` to the label that means a device is operating
+normally. It must be one of **that version's** labels (otherwise 422) and is
+saved together with the artifact, so every version carries its own on-call
+configuration in `/data/models/<version>.json` and in the version registry.
+
+```json
+{
+  "version": "v2",
+  "weights": [[1.2, -0.4], [-0.2, 0.9]],
+  "bias": [-0.10, 0.05],
+  "labels": ["pass", "scratch"],
+  "normal_label": "pass"
+}
+```
+
+A model without `normal_label`, and any `/infer` call without a `device_id`,
+keeps the original behaviour exactly — no per-device state is created.
+
+### Device alarm rule
+
+When a request carries a `device_id` **and** the active model saved a
+`normal_label`, the result is counted for that device:
+
+* counting follows **admission order**, not completion order. Inference stays
+  fully concurrent, but a request admitted later that finishes first cannot be
+  applied before an unsettled earlier request;
+* three consecutive results of the **same version** whose label differs from
+  `normal_label` raise the alarm (the limit is `ALARM_CONSECUTIVE_LIMIT`,
+  default 3). A normal result or a failed computation resets the count to zero;
+* a 504 or a disconnected client does not settle anything early: the shielded
+  worker computation keeps running and its result is applied when it finishes;
+* every model activation (hot swap) clears the current alarm and moves each
+  device to a new generation. Late results of the retired version are
+  discarded and can never pollute the new version's counters.
+
+`GET /admin/device-alarms/{device_id}` returns the version, normal label,
+consecutive count, alarm state and the number of tickets still pending
+settlement.
+
 `POST /admin/models` also accepts these optional fields:
 
 | field | purpose |
 | --- | --- |
+| `normal_label` | optional on-call label; must be one of this version's labels, saved with the model |
 | `test_features` | vector for the pre-activation smoke test (defaults to zeros) |
 | `expected_active_version` | optimistic guard; 409 if the active version changed |
 | `slow_load_ms` | demo: delay worker readiness to watch the old version serve |
@@ -129,8 +173,19 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Device alarm + version isolation.** Upload a model with
+   `"normal_label": "pass"`. Send three `/infer` calls with the same
+   `device_id` whose label differs from `pass` (e.g. negative features for the
+   demo weights); `GET /admin/device-alarms/{device_id}` then reports
+   `"alarm": true` with `consecutive_anomalies: 3`. A normal result clears it.
+   To see admission ordering and 504 behaviour, send two slow calls with a
+   tiny `timeout_ms` and watch `pending` stay non-zero until they settle. Then
+   upload a new version: the alarm clears, and any still-running old-version
+   result is counted under `total_discarded` instead of polluting the new
+   version.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs the first three end to end;
+`python examples/demo_alarms.py <base-url>` runs the device-alarm scenario.
 
 ## Observations from the smoke runs
 
@@ -145,17 +200,19 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 
 ```
 app/
-  main.py             API, swap orchestration, drain loop, status
+  main.py             API, swap orchestration, drain loop, status, alarm endpoints
+  alarm_tracker.py    per-device consecutive-anomaly state machine (ordered settlement)
   process_manager.py  shared registry/state machine + worker process handles
   worker.py           per-versionHTTP server (one process per version)
   worker_launcher.py  process entry point: load artifact, bind, serve, handshake
-  models.py           artifact validation, NumPy scoring
+  models.py           artifact validation (incl. normal_label), NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
   test_registry.py        state machine, claims, drain gate, crash reclaim
+  test_alarm_tracker.py   ordered settlement, resets, version isolation
   test_api_integration.py real API + real worker processes
 examples/
-  demo.py, models/*.json
+  demo.py, demo_alarms.py, models/*.json
 ```
 
 ## Configuration
@@ -166,5 +223,6 @@ examples/
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
+| `ALARM_CONSECUTIVE_LIMIT` | `3` | consecutive non-normal results that raise a device alarm |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |

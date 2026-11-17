@@ -188,7 +188,9 @@ class Registry:
             if self._claims.get(key) == token:
                 del self._claims[key]
 
-    def reserve_any_slot(self, version: str) -> str:
+    def reserve_any_slot(
+        self, version: str, normal_label: Optional[str] = None
+    ) -> str:
         """Atomically pick an idle slot and register a loading candidate.
 
         A version id whose previous attempt *failed* may be retried; the new
@@ -245,6 +247,10 @@ class Registry:
                 "error": None,
                 "attempt": attempt,
                 "previous_error": previous_error,
+                # Optional on-call configuration: the label that means the
+                # device is operating normally.  Stored with the version, so
+                # the alarm rule always uses the label set of this artifact.
+                "normal_label": normal_label,
             }
             return slot_id
 

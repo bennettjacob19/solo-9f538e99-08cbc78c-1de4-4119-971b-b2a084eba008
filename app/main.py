@@ -3,9 +3,12 @@
 Public surface (see ``/docs``):
 
 * ``POST /infer``            -- classify a feature vector with a client timeout
-* ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
+* ``POST /admin/models``     -- upload a classifier artifact (optional
+                                ``normal_label``) and hot-swap it in
 * ``GET  /admin/versions``   -- version registry
 * ``GET  /admin/status``     -- active version, in-flight counts, process states
+* ``GET  /admin/device-alarms``            -- per-device alarm states
+* ``GET  /admin/device-alarms/{device_id}`` -- one device's alarm state
 * ``GET  /healthz``          -- liveness
 
 The invariants live in ``app/process_manager.py``.  In short: every model
@@ -13,6 +16,13 @@ version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
 only releases its slot once every inference it actually accepted has finished
 inside its worker -- regardless of whether the client is still waiting.
+
+The per-device on-call alarm rule lives in ``app/alarm_tracker.py``: only
+device-scoped inference against a model that saved ``normal_label`` is counted,
+results are applied in admission order (concurrent computation, ordered
+settlement), three consecutive non-normal results alarm, normal results or
+failures reset, and every model activation clears the devices so stale
+old-version results cannot pollute the new version.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+from app.alarm_tracker import DEFAULT_ALARM_LIMIT, Admission, DeviceAlarmTracker
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
 from app.process_manager import (
     STATE_DRAINING,
@@ -56,12 +67,15 @@ logging.basicConfig(
 )
 
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DEVICE_ID_RE = re.compile(r"^[^\s/]{1,128}$")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MODEL_DIR = DATA_DIR / "models"
 STAGING_DIR = DATA_DIR / "staging"
 WORK_DIR = DATA_DIR / "workers"
 DEFAULT_TIMEOUT_MS = int(os.environ.get("DEFAULT_INFER_TIMEOUT_MS", "5000"))
 MAX_TIMEOUT_MS = 600_000
+# Consecutive non-normal results (same version, same device) that raise the alarm.
+ALARM_LIMIT = int(os.environ.get("ALARM_CONSECUTIVE_LIMIT", str(DEFAULT_ALARM_LIMIT)))
 # How long an upload may wait for a draining slot to be released before 429.
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
@@ -75,6 +89,19 @@ SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
 
 class InferRequest(BaseModel):
     features: List[float] = Field(..., description="Feature vector for the classifier")
+    device_id: Optional[str] = Field(
+        None,
+        max_length=128,
+        description=(
+            "Identifies the physical QC device. When present and the active model "
+            "has a configured normal_label, results are counted per device in "
+            "admission order: three consecutive results (same version) different "
+            "from normal_label raise an alarm. A normal result or a failed "
+            "computation resets the count. Omit it to keep the original, "
+            "unmonitored inference behaviour."
+        ),
+        examples=["line-3-camera-7"],
+    )
     timeout_ms: Optional[int] = Field(
         None,
         ge=1,
@@ -111,6 +138,18 @@ class InferRequest(BaseModel):
             raise ValueError("features must contain at least one value")
         return value
 
+    @field_validator("device_id")
+    @classmethod
+    def _device_id_shape(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or not DEVICE_ID_RE.match(value):
+            raise ValueError(
+                "device_id must be 1-128 characters and must not contain whitespace or '/'"
+            )
+        return value
+
 
 class InferResponse(BaseModel):
     version: str
@@ -129,6 +168,17 @@ class ModelUpload(BaseModel):
     weights: List[List[float]] = Field(..., description="(n_classes x n_features) matrix")
     bias: List[float] = Field(..., description="Bias vector of length n_classes")
     labels: List[str] = Field(..., description="Class label for each weight row")
+    normal_label: Optional[str] = Field(
+        None,
+        description=(
+            "Optional on-call configuration: the label that means a device is "
+            "operating normally. It must be one of this version's labels and is "
+            "saved together with the model. Device-scoped inference raises an "
+            "alarm after three consecutive results different from it. Omit it to "
+            "leave device monitoring disabled for this version."
+        ),
+        examples=["pass"],
+    )
     test_features: Optional[List[float]] = Field(
         None,
         description="Vector used for the pre-activation smoke test; defaults to all zeros",
@@ -186,6 +236,47 @@ class SwapResult(BaseModel):
     activated_at: float
     test_label: str
     load_seconds: float
+    normal_label: Optional[str] = Field(
+        None,
+        description="Normal label saved with this version, or null when unconfigured.",
+    )
+
+
+class DeviceAlarmView(BaseModel):
+    device_id: str
+    version: Optional[str] = Field(
+        None, description="Version the device's current counters belong to."
+    )
+    normal_label: Optional[str] = Field(
+        None, description="Normal label of the current version, or null when unconfigured."
+    )
+    generation: int = Field(
+        ..., description="Incremented on every model activation; old-version results are discarded."
+    )
+    consecutive_anomalies: int = Field(
+        ..., description="Consecutive same-version results different from normal_label."
+    )
+    alarm: bool = Field(..., description="True once the consecutive count reaches the threshold.")
+    alarm_threshold: int
+    pending: int = Field(
+        ...,
+        description=(
+            "Tickets admitted but not yet settled in admission order, including ones "
+            "whose computation finished but which wait for an earlier ticket."
+        ),
+    )
+    total_admitted: int
+    total_applied: int
+    total_discarded: int = Field(
+        ..., description="Late results of a previous version, discarded at settlement."
+    )
+    last_label: Optional[str]
+    last_outcome: Optional[str]
+    updated_at: Optional[float]
+
+class DeviceAlarmList(BaseModel):
+    alarm_threshold: int
+    devices: List[DeviceAlarmView]
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +296,8 @@ class InferenceService:
         self._background: set[asyncio.Task] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
+        # Per-device consecutive-anomaly state (API-process-local).
+        self.alarms = DeviceAlarmTracker(alarm_limit=ALARM_LIMIT)
 
     # -- lifecycle -------------------------------------------------------
     async def startup(self) -> None:
@@ -234,6 +327,7 @@ class InferenceService:
         bootstrap_model = os.environ.get("BOOTSTRAP_MODEL")
         if bootstrap_version and bootstrap_model and Path(bootstrap_model).is_file():
             try:
+                bootstrap_artifact = load_model(bootstrap_model, version=bootstrap_version)
                 await self.swap_in_path(
                     version=bootstrap_version,
                     source_path=bootstrap_model,
@@ -241,6 +335,7 @@ class InferenceService:
                     test_features=None,
                     slow_load_ms=0,
                     simulate_load_failure=False,
+                    normal_label=bootstrap_artifact.normal_label,
                 )
                 logger.info("bootstrapped model %s", bootstrap_version)
             except Exception:
@@ -267,6 +362,7 @@ class InferenceService:
                 )
         for task in list(self._background):
             task.cancel()
+        await self.alarms.aclose()
         for handle in list(self.handles.values()):
             await asyncio.to_thread(handle.stop, 5.0)
         self.handles.clear()
@@ -295,7 +391,9 @@ class InferenceService:
             dst.write(src.read())
         os.replace(tmp, target)
 
-    async def _reserve_slot(self, version: str) -> str:
+    async def _reserve_slot(
+        self, version: str, normal_label: Optional[str] = None
+    ) -> str:
         """Reserve a process slot for a candidate, waiting briefly for a drain.
 
         A slot that is draining with zero in-flight work is about to be freed
@@ -306,7 +404,7 @@ class InferenceService:
         deadline = time.monotonic() + SWAP_WAIT_SECONDS
         while True:
             try:
-                return self.registry.reserve_any_slot(version)
+                return self.registry.reserve_any_slot(version, normal_label)
             except SwapConflict as exc:
                 # e.g. the version id was registered concurrently, or a retry
                 # of a failed id raced a live one.
@@ -378,6 +476,7 @@ class InferenceService:
         test_features: Optional[List[float]],
         slow_load_ms: int,
         simulate_load_failure: bool,
+        normal_label: Optional[str] = None,
     ) -> SwapResult:
         """Load a candidate in a fresh process, smoke-test it, then promote it.
 
@@ -424,7 +523,7 @@ class InferenceService:
             try:
                 # Re-check under the lock: a concurrent request may have
                 # registered this version while we waited.
-                slot_id = await self._reserve_slot(version)
+                slot_id = await self._reserve_slot(version, normal_label)
 
                 handle = WorkerHandle(
                     slot_id=slot_id,
@@ -499,6 +598,10 @@ class InferenceService:
                         },
                     ) from exc
                 committed = True
+                # New version is now live: clear every device's current alarm
+                # and counters and move them to a new generation, so late
+                # results of the retired version cannot pollute the new one.
+                self.alarms.activate_version(version, normal_label)
                 # Keep a durable copy of what is now serving.  Staged uploads
                 # are cleaned up by the endpoint; this snapshot is what a
                 # future restart can reload.
@@ -510,11 +613,12 @@ class InferenceService:
                 new_info = self.registry.version_info(version)
                 assert new_info is not None
                 logger.info(
-                    "activated model %s in %s (previous=%s, pid=%s)",
+                    "activated model %s in %s (previous=%s, pid=%s, normal_label=%r)",
                     version,
                     slot_id,
                     old_version,
                     handle.pid,
+                    normal_label,
                 )
                 return SwapResult(
                     version=version,
@@ -526,6 +630,7 @@ class InferenceService:
                     activated_at=float(new_info["activated_at"]),
                     test_label=test_body["label"],
                     load_seconds=float(ready.get("load_seconds", 0.0)),
+                    normal_label=normal_label,
                 )
             except HTTPException:
                 raise
@@ -610,7 +715,11 @@ class InferenceService:
 
     # -- inference -------------------------------------------------------
     async def infer(
-        self, features: List[float], timeout_ms: int, slow_ms: int = 0
+        self,
+        features: List[float],
+        timeout_ms: int,
+        slow_ms: int = 0,
+        device_id: Optional[str] = None,
     ) -> InferResponse:
         try:
             version, _slot_id = self.registry.accept_work(len(features))
@@ -631,9 +740,23 @@ class InferenceService:
                 detail={"error": "no_active_model", "message": str(exc)},
             ) from exc
 
+        # Device monitoring is opt-in per model: only versions that saved a
+        # normal_label participate, and only when the caller names a device.
+        # Anonymous inference against any model keeps the original behaviour.
+        version_info = self.registry.version_info(version) or {}
+        normal_label = version_info.get("normal_label")
+        admission: Optional[Admission] = None
+        if device_id and normal_label:
+            admission = self.alarms.admit(device_id, version, normal_label)
+
         handle = self.handles.get(version)
         if handle is None:  # pragma: no cover - registry/handle invariant
             self.registry.complete_work(version)
+            if admission is not None:
+                # A failed computation resets the streak rather than extending it.
+                DeviceAlarmTracker.fail(
+                    admission, RuntimeError("worker process is gone")
+                )
             raise HTTPException(
                 status_code=503,
                 detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
@@ -646,10 +769,16 @@ class InferenceService:
 
         # Shield the worker call from this request's timeout/cancellation.  The
         # in-flight counter must only clear when the model process is actually
-        # done; a 504 or disconnected client must not fake completion.
+        # done; a 504 or disconnected client must not fake completion.  The
+        # alarm ticket is resolved by this same task, so results that arrive
+        # after the client gave up still take part in the judgement.
         task = asyncio.create_task(self._proxy_inference(version, handle, payload))
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        if admission is not None:
+            task.add_done_callback(
+                lambda t, a=admission: self._settle_admission(t, a)
+            )
 
         started = time.perf_counter()
         try:
@@ -657,10 +786,11 @@ class InferenceService:
         except asyncio.TimeoutError:
             elapsed = (time.perf_counter() - started) * 1000.0
             logger.warning(
-                "inference on %s exceeded %dms (request %s); worker continues",
+                "inference on %s exceeded %dms (request %s, device=%s); worker continues",
                 version,
                 timeout_ms,
                 inference_id,
+                device_id,
             )
             raise HTTPException(
                 status_code=504,
@@ -672,7 +802,8 @@ class InferenceService:
                     "note": (
                         "The client stopped waiting, but the model process continues "
                         "the computation; its slot is not released until that work "
-                        "actually finishes."
+                        "actually finishes, and a device-scoped result still counts "
+                        "towards the alarm state when it settles."
                     ),
                 },
             )
@@ -699,6 +830,23 @@ class InferenceService:
             inference_id=inference_id,
             elapsed_ms=round(elapsed, 3),
         )
+
+    @staticmethod
+    def _settle_admission(task: "asyncio.Task[Dict[str, Any]]", admission: Admission) -> None:
+        """Resolve the alarm ticket once the shielded worker call settles.
+
+        Runs as a done-callback, so it fires even when the HTTP request already
+        returned 504 or the client disconnected.
+        """
+        if task.cancelled():
+            DeviceAlarmTracker.fail(admission, asyncio.CancelledError())
+            return
+        exc = task.exception()
+        if exc is not None:
+            DeviceAlarmTracker.fail(admission, exc)
+            return
+        body = task.result()
+        DeviceAlarmTracker.succeed(admission, body["label"], float(body["score"]))
 
     async def _proxy_inference(
         self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
@@ -790,24 +938,40 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Edge QC Classifier Inference Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Linear classifier inference with live model replacement on an edge QC "
         "machine that can host at most **two model processes**.\n\n"
-        "* `POST /admin/models` uploads `weights`, `bias` and `labels`; the new "
-        "version is loaded in a free process, smoke-tested, then promoted. The "
-        "old version keeps serving during load and keeps serving if the new one "
-        "fails.\n"
+        "* `POST /admin/models` uploads `weights`, `bias` and `labels`, plus an "
+        "optional `normal_label` that must be one of that version's labels and is "
+        "saved with the model. The new version is loaded in a free process, "
+        "smoke-tested, then promoted. The old version keeps serving during load and "
+        "keeps serving if the new one fails.\n"
         "* `POST /infer` returns the top-scoring label and the version. Requests "
-        "are pinned to the version active when accepted. `timeout_ms` (or "
-        "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
-        "while the worker keeps working and keeps its slot.\n"
+        "are pinned to the version active when accepted. Add `device_id` to opt a "
+        "device into the on-call alarm rule (only effective when the active model "
+        "configured `normal_label`): the same version's results are counted in "
+        "**admission order** -- three consecutive results different from "
+        "`normal_label` raise an alarm; a normal result or a failed computation "
+        "resets the count. Concurrent inference stays concurrent; a later request "
+        "that finishes first never overtakes an unsettled earlier one. Results that "
+        "finish after a 504 / client disconnect still settle into the judgement. "
+        "A model swap clears every device's alarm and old-version late results are "
+        "discarded.\n"
+        "* `GET /admin/device-alarms` lists every monitored device and "
+        "`GET /admin/device-alarms/{device_id}` shows one: version, normal label, "
+        "consecutive count, alarm state and the number of tickets still pending "
+        "settlement.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
         "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
         "drained version still works, only one slot is free.\n"
+        "- Device alarm: upload a model with `normal_label`, send three `/infer` "
+        "calls with the same `device_id` whose labels differ from it (use `slow_ms` "
+        "with small timeouts to see 504-era results still count), watch "
+        "`/admin/device-alarms`, then upload a new version and see the alarm clear.\n"
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
@@ -829,7 +993,10 @@ def healthz() -> Dict[str, Any]:
     responses={
         504: {
             "model": TimeoutResponse,
-            "description": "Client timeout; the worker keeps computing and holds its slot.",
+            "description": (
+                "Client timeout; the worker keeps computing and holds its slot. "
+                "A device-scoped result still settles into the alarm state later."
+            ),
         },
         503: {"description": "No active model"},
         502: {"description": "Worker unreachable or errored"},
@@ -844,7 +1011,9 @@ async def infer(req: InferRequest) -> InferResponse:
         timeout_ms = max(1, int(round(req.timeout_seconds * 1000)))
     else:
         timeout_ms = DEFAULT_TIMEOUT_MS
-    return await service.infer(req.features, timeout_ms, req.slow_ms)
+    return await service.infer(
+        req.features, timeout_ms, req.slow_ms, device_id=req.device_id
+    )
 
 
 @app.post(
@@ -891,6 +1060,7 @@ async def upload_model(payload: ModelUpload) -> SwapResult:
             test_features=payload.test_features,
             slow_load_ms=payload.slow_load_ms,
             simulate_load_failure=payload.simulate_load_failure,
+            normal_label=payload.normal_label,
         )
     finally:
         # The worker process holds its own loaded copy in memory; the staging
@@ -922,3 +1092,40 @@ def versions() -> Dict[str, Any]:
 )
 def status() -> StatusView:
     return service.status()
+
+
+@app.get(
+    "/admin/device-alarms",
+    response_model=DeviceAlarmList,
+    tags=["alarms"],
+    summary="Per-device consecutive-anomaly alarm states",
+)
+async def device_alarms() -> DeviceAlarmList:
+    return DeviceAlarmList(
+        alarm_threshold=ALARM_LIMIT,
+        devices=[DeviceAlarmView(**d) for d in service.alarms.list_devices()],
+    )
+
+
+@app.get(
+    "/admin/device-alarms/{device_id}",
+    response_model=DeviceAlarmView,
+    responses={404: {"description": "This device has never sent a monitored inference"}},
+    tags=["alarms"],
+    summary="Alarm state for one device (version, streak, alarm, pending)",
+)
+async def device_alarm(device_id: str) -> DeviceAlarmView:
+    view = service.alarms.get_device(device_id)
+    if view is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_device",
+                "message": (
+                    f"no monitored inference recorded for device {device_id!r}; the "
+                    "device only appears once it calls /infer with device_id against "
+                    "a model that configured normal_label"
+                ),
+            },
+        )
+    return DeviceAlarmView(**view)

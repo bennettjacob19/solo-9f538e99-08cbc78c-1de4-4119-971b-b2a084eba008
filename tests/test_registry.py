@@ -9,6 +9,7 @@ import pytest
 from app.process_manager import (
     VERSION_ACTIVE,
     VERSION_FAILED,
+    VERSION_LOADING,
     VERSION_RETIRED,
     FeatureMismatch,
     NoActiveModel,
@@ -212,3 +213,14 @@ def test_dead_active_worker_releases_slot(registry):
     assert registry.active_version() is None
     assert registry.has_capacity()
     assert registry.version_info("v1")["state"] == VERSION_FAILED
+
+
+def test_normal_label_is_saved_with_version(registry):
+    # Unconfigured versions store None and keep the old behaviour.
+    registry.reserve_any_slot("plain")
+    assert registry.version_info("plain")["normal_label"] is None
+
+    registry.reserve_any_slot("guarded", normal_label="pass")
+    info = registry.version_info("guarded")
+    assert info["normal_label"] == "pass"
+    assert info["state"] == VERSION_LOADING

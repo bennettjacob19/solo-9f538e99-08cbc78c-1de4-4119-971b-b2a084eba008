@@ -117,15 +117,61 @@ def upload(api: ApiServer, payload, timeout=40.0):
     return httpx.post(f"{api.base}/admin/models", json=payload, timeout=timeout)
 
 
-def infer(api: ApiServer, features, timeout_ms=None, slow_ms=0, timeout=40.0):
+def infer(api: ApiServer, features, timeout_ms=None, slow_ms=0, timeout=40.0, device_id=None):
     body = {"features": features, "slow_ms": slow_ms}
     if timeout_ms is not None:
         body["timeout_ms"] = timeout_ms
+    if device_id is not None:
+        body["device_id"] = device_id
     return httpx.post(f"{api.base}/infer", json=body, timeout=timeout)
 
 
 def status(api: ApiServer):
     return httpx.get(f"{api.base}/admin/status", timeout=5.0).json()
+
+
+def alarms(api: ApiServer):
+    return httpx.get(f"{api.base}/admin/device-alarms", timeout=5.0).json()
+
+
+def alarm_view(api: ApiServer, device_id: str):
+    return httpx.get(f"{api.base}/admin/device-alarms/{device_id}", timeout=5.0)
+
+
+def wait_alarm_settled(
+    api: ApiServer,
+    device_id: str,
+    admitted: int,
+    timeout=15.0,
+    require_empty_pending=True,
+):
+    """Wait until ``admitted`` tickets have all been applied or discarded.
+
+    By default the device must also show no pending tickets. When other
+    devices' slow tickets can still be in flight (e.g. right after a worker is
+    killed), pass ``require_empty_pending=False`` and check the settled counts
+    directly.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = alarm_view(api, device_id)
+        if resp.status_code == 200:
+            view = resp.json()
+            settled = view["total_applied"] + view["total_discarded"]
+            if settled >= admitted and (
+                not require_empty_pending or view["pending"] == 0
+            ):
+                return view
+        time.sleep(0.05)
+    raise AssertionError("alarm tickets did not settle in time")
+
+
+# Two-feature model: argmax over [+x, -x] -> NORMAL_LABEL for positive x,
+# NORM_OTHER for negative x, so a single-feature vector drives either label.
+NORMAL_LABEL = "pass"
+NORM_OTHER = "defect-A"
+NORM_LABELS = [NORMAL_LABEL, NORM_OTHER]
+W_NORM = [[1.0, 0.0], [-1.0, 0.0]]
 
 
 def wait_for(predicate, timeout=10.0, interval=0.05):
@@ -366,6 +412,299 @@ def test_11_stale_expected_version(api):
     )
     assert resp.status_code == 409
     assert resp.json()["detail"]["error"] == "swap_conflict"
+
+
+# ---------------------------------------------------------------------------
+# Device alarm behaviour (normal_label + device_id)
+# ---------------------------------------------------------------------------
+
+
+def test_13_normal_label_must_belong_to_version_labels(api):
+    resp = upload(
+        api,
+        artifact(
+            "al-v1",
+            W_NORM,
+            [0.0, 0.0],
+            NORM_LABELS,
+            normal_label="not-a-real-label",
+        ),
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "invalid_artifact"
+    # The version was never created.
+    assert all(v["version"] != "al-v1" for v in status(api)["versions"])
+
+
+def test_14_anonymous_inference_is_not_tracked(api):
+    resp = upload(
+        api,
+        artifact("al-v1", W_NORM, [0.0, 0.0], NORM_LABELS, normal_label=NORMAL_LABEL),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["normal_label"] == NORMAL_LABEL
+
+    # No device_id -> original behaviour, no device record is created.
+    r = infer(api, [0.9, 0.1])
+    assert r.status_code == 200
+    assert r.json()["label"] == NORMAL_LABEL
+    listed = alarms(api)
+    assert listed["alarm_threshold"] == 3
+    assert all(d["device_id"] != "ghost" for d in listed["devices"])
+    assert alarm_view(api, "ghost").status_code == 404
+
+
+def test_15_three_consecutive_anomalies_alarm_then_normal_resets(api):
+    device = "line-3-camera-7"
+    # Negative first feature -> NORM_OTHER (anomaly vs normal_label pass).
+    for _ in range(3):
+        r = infer(api, [-0.9, 0.1], device_id=device)
+        assert r.status_code == 200
+        assert r.json()["label"] == NORM_OTHER
+    view = wait_alarm_settled(api, device, 3)
+    assert view["version"] == "al-v1"
+    assert view["normal_label"] == NORMAL_LABEL
+    assert view["consecutive_anomalies"] == 3
+    assert view["alarm"] is True
+    assert view["pending"] == 0
+
+    # A normal result clears both the streak and the alarm.
+    r = infer(api, [0.9, 0.1], device_id=device)
+    assert r.json()["label"] == NORMAL_LABEL
+    view = wait_alarm_settled(api, device, 4)
+    assert view["consecutive_anomalies"] == 0
+    assert view["alarm"] is False
+    assert view["last_outcome"] == "normal"
+
+
+def test_16_two_anomalies_do_not_alarm_and_are_independent_per_device(api):
+    d1, d2 = "dev-a", "dev-b"
+    for _ in range(2):
+        assert infer(api, [-0.9, 0.1], device_id=d1).status_code == 200
+    view = wait_alarm_settled(api, d1, 2)
+    assert view["consecutive_anomalies"] == 2
+    assert view["alarm"] is False
+
+    # d2 stays untouched.
+    assert alarm_view(api, d2).status_code == 404
+
+    # Third anomaly for d1 alarms.
+    assert infer(api, [-0.9, 0.1], device_id=d1).status_code == 200
+    view = wait_alarm_settled(api, d1, 3)
+    assert view["alarm"] is True
+
+
+def test_17_timeout_result_still_counts_and_ordering_is_admission_order(api):
+    device = "slow-cam"
+    # Admit two slow anomaly requests with an impatient client; both 504 but
+    # the worker keeps computing and the tickets must still settle.
+    for _ in range(2):
+        r = infer(api, [-0.9, 0.1], timeout_ms=150, slow_ms=1500, device_id=device)
+        assert r.status_code == 504, r.text
+    mid = alarms(api)["devices"]
+    mid = next(d for d in mid if d["device_id"] == device)
+    # Admitted but not settled yet (the first worker call is still running).
+    assert mid["pending"] == 2
+    assert mid["total_applied"] == 0
+
+    # A third, fast anomaly after the slow ones finish must apply *after* them
+    # in admission order; wait for the slow work to settle first.
+    wait_alarm_settled(api, device, 2, timeout=15)
+    r = infer(api, [-0.9, 0.1], device_id=device)
+    assert r.status_code == 200
+    view = wait_alarm_settled(api, device, 3)
+    assert view["consecutive_anomalies"] == 3
+    assert view["alarm"] is True
+    assert view["pending"] == 0
+
+
+def test_18_swap_clears_alarm_and_old_version_late_results_are_discarded(api):
+    device = "swap-cam"
+    # Bring the device into alarm on al-v1.
+    for _ in range(3):
+        assert infer(api, [-0.9, 0.1], device_id=device).status_code == 200
+    view = wait_alarm_settled(api, device, 3)
+    assert view["alarm"] is True
+
+    # An old-version request is admitted, then made slow so it is still
+    # running when the swap commits.
+    slow = infer(
+        api,
+        [-0.9, 0.1],
+        timeout_ms=150,
+        slow_ms=2500,
+        device_id=device,
+    )
+    assert slow.status_code == 504
+    before = next(d for d in alarms(api)["devices"] if d["device_id"] == device)
+    assert before["pending"] == 1
+
+    # New version (different weights, same normal label) activates; alarm clears.
+    resp = upload(
+        api,
+        artifact(
+            "al-v2",
+            W_NORM,
+            [0.1, -0.1],
+            NORM_LABELS,
+            normal_label=NORMAL_LABEL,
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    after_swap = alarm_view(api, device).json()
+    assert after_swap["version"] == "al-v2"
+    assert after_swap["alarm"] is False
+    assert after_swap["consecutive_anomalies"] == 0
+
+    # The late old-version anomaly settles but must not pollute the new
+    # version.  Wait for the 4 admitted tickets (3 fast + 1 slow) to drain.
+    view = wait_alarm_settled(api, device, 4, timeout=15)
+    assert view["total_discarded"] == 1
+    assert view["total_applied"] == 3  # only the pre-swap fast ones
+    assert view["consecutive_anomalies"] == 0
+    assert view["alarm"] is False
+
+    # Fresh inference on the new version counts from scratch.
+    assert infer(api, [-0.9, 0.1], device_id=device).status_code == 200
+    view = wait_alarm_settled(api, device, 5)
+    assert view["total_applied"] == 4
+    assert view["total_discarded"] == 1
+    assert view["consecutive_anomalies"] == 1
+    assert view["version"] == "al-v2"
+
+
+def test_19_model_without_normal_label_keeps_original_behaviour(api):
+    device = "unmonitored-cam"
+    resp = upload(api, artifact("plain-v1", W_A, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["normal_label"] is None
+    for _ in range(4):
+        assert infer(api, [0.9, 0.1], device_id=device).status_code == 200
+    # Even with device_id, an unconfigured model never creates device state.
+    assert alarm_view(api, device).status_code == 404
+
+
+def test_20_disconnected_client_result_still_settles(api):
+    # Ensure a model with a normal label is active without depending on order.
+    active_version = status(api)["active_version"]
+    active_info = next(
+        (v for v in status(api)["versions"] if v["version"] == active_version),
+        None,
+    )
+    if not active_info or not active_info.get("normal_label"):
+        resp = upload(
+            api,
+            artifact("disc-v1", W_NORM, [0.0, 0.0], NORM_LABELS, normal_label=NORMAL_LABEL),
+        )
+        assert resp.status_code == 201, resp.text
+    device = "disconnect-cam"
+
+    # Fire a slow device inference with a very short client timeout built into
+    # httpx: the client gives up (ReadTimeout) while the worker keeps computing.
+    with httpx.Client(base_url=api.base, timeout=0.1) as impatient:
+        with pytest.raises(httpx.ReadTimeout):
+            impatient.post(
+                "/infer",
+                json={
+                    "features": [-0.9, 0.1],
+                    "slow_ms": 1500,
+                    "device_id": device,
+                },
+            )
+
+    # The ticket was admitted; it must settle into the alarm state once the
+    # shielded worker call finishes, even though no client is waiting.
+    view = wait_alarm_settled(api, device, 1, timeout=15)
+    assert view["total_applied"] == 1
+    assert view["total_discarded"] == 0
+    assert view["consecutive_anomalies"] == 1
+    assert view["alarm"] is False
+    assert view["last_outcome"] == "anomaly"
+
+
+def test_21_failed_computation_resets_the_streak(api):
+    # Ensure a monitored model is active and reachable.
+    active_version = status(api)["active_version"]
+    active_info = next(
+        (v for v in status(api)["versions"] if v["version"] == active_version),
+        None,
+    )
+    if not active_info or not active_info.get("normal_label"):
+        resp = upload(
+            api,
+            artifact("fail-v1", W_NORM, [0.0, 0.0], NORM_LABELS, normal_label=NORMAL_LABEL),
+        )
+        assert resp.status_code == 201, resp.text
+
+    device = "failure-cam"
+    # Build a streak of two anomalies.
+    for _ in range(2):
+        assert infer(api, [-0.9, 0.1], device_id=device).status_code == 200
+    view = wait_alarm_settled(api, device, 2)
+    assert view["consecutive_anomalies"] == 2
+    assert view["alarm"] is False
+
+    # Make sure no earlier slow inference is still queued in the worker before
+    # we kill it, so this device's next ticket is the only one in flight.
+    drain_deadline = time.time() + 15
+    while time.time() < drain_deadline:
+        if status(api)["total_in_flight"] == 0:
+            break
+        time.sleep(0.1)
+    assert status(api)["total_in_flight"] == 0
+
+    active_slot = next(
+        s for s in status(api)["slots"] if s["process_state"] == "active"
+    )
+    pid = active_slot["pid"]
+    assert pid
+
+    # Admit a slow device inference first so the alarm ticket exists, then kill
+    # the worker while the computation is in flight.  The shielded call fails
+    # and the ticket must settle as an error (reset), never as a third anomaly.
+    with httpx.Client(base_url=api.base, timeout=30.0) as client:
+        import threading
+
+        holder: dict = {}
+
+        def fire():
+            holder["resp"] = client.post(
+                "/infer",
+                json={
+                    "features": [-0.9, 0.1],
+                    "device_id": device,
+                    "slow_ms": 3000,
+                },
+            )
+
+        t = threading.Thread(target=fire)
+        t.start()
+        # Wait until the request is admitted (and the worker picked it up).
+        wait_for(lambda: status(api)["total_in_flight"] >= 1, timeout=10)
+        admitted = alarm_view(api, device).json()
+        assert admitted["total_admitted"] == 3
+        os.kill(pid, 9)
+        t.join(timeout=30)
+        assert holder["resp"].status_code in (502, 503), holder["resp"].status_code
+
+    # The failed ticket settles as an error-outcome and clears the streak.
+    # Other devices' slow tickets may still be pending, so key off the settled
+    # counts for this device rather than a global empty-pending condition.
+    deadline2 = time.time() + 15
+    view = None
+    while time.time() < deadline2:
+        candidate = alarm_view(api, device)
+        if candidate.status_code == 200:
+            view = candidate.json()
+            if view["total_applied"] + view["total_discarded"] >= 3:
+                break
+        time.sleep(0.05)
+    assert view is not None and (
+        view["total_applied"] + view["total_discarded"] >= 3
+    )
+    assert view["consecutive_anomalies"] == 0
+    assert view["alarm"] is False
+    assert view["last_outcome"] == "error"
 
 
 def test_12_no_model_after_shutdown(api):

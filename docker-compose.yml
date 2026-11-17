@@ -12,6 +12,10 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # Consecutive non-normal results (same version, same device) that raise
+      # the per-device alarm. Only inference carrying device_id against a
+      # model that configured normal_label is counted.
+      ALARM_CONSECUTIVE_LIMIT: "3"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1

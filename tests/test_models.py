@@ -17,7 +17,7 @@ from app.models import (
 
 
 def test_validate_accepts_consistent_artifact():
-    weights, bias, labels = validate_artifact(
+    weights, bias, labels, normal_label = validate_artifact(
         {
             "weights": [[1.0, 2.0], [3.0, 4.0]],
             "bias": [0.5, -0.5],
@@ -27,6 +27,40 @@ def test_validate_accepts_consistent_artifact():
     assert weights.shape == (2, 2)
     assert bias.shape == (2,)
     assert labels == ["ok", "ng"]
+    assert normal_label is None
+
+
+def test_validate_accepts_normal_label_in_label_set():
+    weights, bias, labels, normal_label = validate_artifact(
+        {
+            "weights": [[1.0, 2.0], [3.0, 4.0]],
+            "bias": [0.5, -0.5],
+            "labels": ["ok", "ng"],
+            "normal_label": "ok",
+        }
+    )
+    assert labels == ["ok", "ng"]
+    assert normal_label == "ok"
+
+
+@pytest.mark.parametrize(
+    "normal_label,fragment",
+    [
+        ("missing", "must be one of this version's labels"),
+        ("", "non-empty string"),
+        (123, "non-empty string"),
+    ],
+)
+def test_validate_rejects_bad_normal_label(normal_label, fragment):
+    payload = {
+        "weights": [[1.0, 2.0], [3.0, 4.0]],
+        "bias": [0.5, -0.5],
+        "labels": ["ok", "ng"],
+        "normal_label": normal_label,
+    }
+    with pytest.raises(ModelValidationError) as exc:
+        validate_artifact(payload)
+    assert fragment in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -68,8 +102,35 @@ def test_save_and_load_roundtrip(tmp_path):
     assert model.version == "v9"
     assert model.n_features == 2
     assert model.labels == ["only"]
+    assert model.normal_label is None
     # persisted document carries the version for bootstrap reloads
     assert json.loads(path.read_text())["version"] == "v9"
+
+
+def test_normal_label_roundtrip_and_omission(tmp_path):
+    path = tmp_path / "m.json"
+    save_artifact(
+        str(path),
+        "v10",
+        {
+            "weights": [[1, 2], [3, 4]],
+            "bias": [0.0, 0.0],
+            "labels": ["pass", "fail"],
+            "normal_label": "pass",
+        },
+    )
+    doc = json.loads(path.read_text())
+    assert doc["normal_label"] == "pass"
+    model = load_model(str(path))
+    assert model.normal_label == "pass"
+
+    # An artifact without normal_label stays byte-compatible with older versions.
+    plain = tmp_path / "plain.json"
+    save_artifact(
+        str(plain), "v11", {"weights": [[1]], "bias": [0.0], "labels": ["x"]}
+    )
+    assert "normal_label" not in json.loads(plain.read_text())
+    assert load_model(str(plain)).normal_label is None
 
 
 def test_load_rejects_corrupt_file(tmp_path):
